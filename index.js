@@ -1,63 +1,90 @@
 // server/index.js
 const express = require('express');
 const fetch = require('node-fetch'); // v2
+const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '20mb' }));
 
-// CORS - allow frontend origin or all if not set
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || '*';
 app.use(cors({ origin: FRONTEND_ORIGIN }));
 
 const PORT = process.env.PORT || 4000;
-
-// Default image endpoint (common public path). You can override in .env.
 const IMAGE_API_URL = process.env.PROVIDER_IMAGE_API_URL || 'https://api.stability.ai/v2beta/stable-image/generate/core';
 const API_KEY = process.env.PROVIDER_API_KEY || '';
 
 const OUT_DIR = path.join(__dirname, 'out');
 if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
 
-/**
- * Save base64 image buffer to disk and return public path
- * returns a string like '/out/imagename.png'
- */
 function saveBase64ImageToOut(base64String) {
-  // strip data url if present
   const matches = base64String.match(/^data:([A-Za-z-+/]+);base64,(.+)$/);
   let data = base64String;
   let ext = 'png';
   if (matches && matches.length === 3) {
     data = matches[2];
-    const mime = matches[1]; // e.g. image/png
+    const mime = matches[1];
     if (mime === 'image/jpeg' || mime === 'image/jpg') ext = 'jpg';
     else if (mime === 'image/webp') ext = 'webp';
     else ext = 'png';
   }
-
   const buffer = Buffer.from(data, 'base64');
   const filename = `image-${Date.now()}-${Math.floor(Math.random() * 10000)}.${ext}`;
   const outPath = path.join(OUT_DIR, filename);
   fs.writeFileSync(outPath, buffer);
-  // return URL path (served by express)
   return `/out/${filename}`;
 }
 
-// Health
 app.get('/health', (req, res) => res.json({ ok: true }));
-
-// Serve static public and out
 app.use(express.static(path.join(__dirname, '..', 'public')));
 app.use('/out', express.static(OUT_DIR));
 
-/**
- * POST /api/generate-image
- * Body: { prompt, width, height, samples }
- */
+async function postJsonToProvider(url, apiKey, bodyObj) {
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify(bodyObj),
+    timeout: 60000
+  });
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) { /* not json */ }
+  return { ok: resp.ok, status: resp.status, statusText: resp.statusText, text, json };
+}
+
+async function postFormToProvider(url, apiKey, bodyObj) {
+  const form = new FormData();
+  if (bodyObj.text_prompts) {
+    form.append('text_prompts', JSON.stringify(bodyObj.text_prompts));
+  }
+  if (bodyObj.width) form.append('width', String(bodyObj.width));
+  if (bodyObj.height) form.append('height', String(bodyObj.height));
+  if (bodyObj.samples) form.append('samples', String(bodyObj.samples));
+  if (bodyObj.model) form.append('model', bodyObj.model);
+
+  const headers = form.getHeaders();
+  headers['Authorization'] = `Bearer ${apiKey}`;
+  headers['Accept'] = 'application/json';
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: form,
+    timeout: 60000
+  });
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) { /* not json */ }
+  return { ok: resp.ok, status: resp.status, statusText: resp.statusText, text, json };
+}
+
 app.post('/api/generate-image', async (req, res) => {
   try {
     const prompt = (req.body.prompt || '').trim();
@@ -68,48 +95,86 @@ app.post('/api/generate-image', async (req, res) => {
     if (!prompt || prompt.length < 3) return res.status(400).json({ error: 'Prompt too short' });
     if (!API_KEY) return res.status(500).json({ error: 'Server not configured with PROVIDER_API_KEY' });
 
-    // Build provider request body based on Stability v2beta image API
-    const body = {
+    const payload = {
       text_prompts: [{ text: prompt }],
       width,
       height,
       samples
     };
 
-    const pResp = await fetch(IMAGE_API_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body)
+    // Try JSON
+    const jsonAttempt = await postJsonToProvider(IMAGE_API_URL, API_KEY, payload);
+    if (jsonAttempt.ok) {
+      const pdata = jsonAttempt.json || null;
+      const b64 = (pdata && pdata.artifacts && pdata.artifacts[0] && pdata.artifacts[0].base64) ||
+                  (pdata && pdata.image_base64) || null;
+      if (b64) {
+        const savedPath = saveBase64ImageToOut(b64);
+        return res.json({ imageUrl: savedPath, providerResponse: pdata });
+      }
+      const imageUrl = (pdata && pdata.output && pdata.output[0] && pdata.output[0].url) ||
+                       (pdata && pdata.image_url) || null;
+      if (imageUrl) {
+        try {
+          const dResp = await fetch(imageUrl);
+          if (dResp.ok) {
+            const buffer = await dResp.buffer();
+            const filename = `image-${Date.now()}-${Math.floor(Math.random()*10000)}.png`;
+            fs.writeFileSync(path.join(OUT_DIR, filename), buffer);
+            return res.json({ imageUrl: `/out/${filename}`, providerResponse: pdata });
+          } else {
+            return res.json({ imageUrl: imageUrl, providerResponse: pdata });
+          }
+        } catch (e) {
+          return res.json({ imageUrl: imageUrl, providerResponse: pdata });
+        }
+      }
+      return res.status(500).json({ error: 'No image returned in provider JSON', payload: pdata });
+    }
+
+    // JSON failed — decide whether to retry with form-data
+    const lowerText = (jsonAttempt.text || '').toLowerCase();
+    if (jsonAttempt.status === 400 || lowerText.includes('multipart') || lowerText.includes('content-type') || lowerText.includes('accept')) {
+      const formAttempt = await postFormToProvider(IMAGE_API_URL, API_KEY, payload);
+      if (formAttempt.ok) {
+        const pdata = formAttempt.json || null;
+        const b64 = (pdata && pdata.artifacts && pdata.artifacts[0] && pdata.artifacts[0].base64) ||
+                    (pdata && pdata.image_base64) || null;
+        if (b64) {
+          const savedPath = saveBase64ImageToOut(b64);
+          return res.json({ imageUrl: savedPath, providerResponse: pdata });
+        }
+        const imageUrl = (pdata && pdata.output && pdata.output[0] && pdata.output[0].url) ||
+                         (pdata && pdata.image_url) || null;
+        if (imageUrl) {
+          try {
+            const dResp = await fetch(imageUrl);
+            if (dResp.ok) {
+              const buffer = await dResp.buffer();
+              const filename = `image-${Date.now()}-${Math.floor(Math.random()*10000)}.png`;
+              fs.writeFileSync(path.join(OUT_DIR, filename), buffer);
+              return res.json({ imageUrl: `/out/${filename}`, providerResponse: pdata });
+            } else {
+              return res.json({ imageUrl: imageUrl, providerResponse: pdata });
+            }
+          } catch (e) {
+            return res.json({ imageUrl: imageUrl, providerResponse: pdata });
+          }
+        }
+        return res.status(500).json({ error: 'No image returned in provider form response', payload: pdata });
+      } else {
+        return res.status(502).json({
+          error: `Provider initial error (json ${jsonAttempt.status}) and form-data retry (status ${formAttempt.status})`,
+          jsonAttempt: { status: jsonAttempt.status, text: jsonAttempt.text },
+          formAttempt: { status: formAttempt.status, text: formAttempt.text }
+        });
+      }
+    }
+
+    return res.status(502).json({
+      error: `Provider initial error: ${jsonAttempt.status} ${jsonAttempt.statusText}`,
+      details: jsonAttempt.text
     });
-
-    if (!pResp.ok) {
-      const t = await pResp.text();
-      console.error('Provider initial error:', pResp.status, t);
-      return res.status(502).json({ error: `Provider initial error: ${pResp.status} ${pResp.statusText}`, details: t });
-    }
-
-    const pdata = await pResp.json();
-
-    // Common Stability image response shapes:
-    // - artifacts: [{base64: "..."}]
-    // - or some responses might include a top-level image_base64
-    const b64 =
-      (pdata.artifacts && pdata.artifacts[0] && pdata.artifacts[0].base64) ||
-      pdata.image_base64 ||
-      null;
-
-    if (!b64) {
-      // Return provider payload for debugging
-      return res.status(500).json({ error: 'No image returned from provider', payload: pdata });
-    }
-
-    const savedPath = saveBase64ImageToOut(b64);
-    const publicUrl = savedPath; // relative path; frontend will prefix origin if needed
-
-    return res.json({ imageUrl: publicUrl, providerResponse: pdata });
 
   } catch (err) {
     console.error('Server error (generate-image):', err);
@@ -121,4 +186,3 @@ app.listen(PORT, () => {
   console.log(`Server started on port ${PORT}`);
   console.log(`Image API URL: ${IMAGE_API_URL}`);
 });
-
