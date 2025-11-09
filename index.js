@@ -59,11 +59,26 @@ async function postJsonToProvider(url, apiKey, bodyObj) {
   return { ok: resp.ok, status: resp.status, statusText: resp.statusText, text, json };
 }
 
+/**
+ * postFormToProvider sends both text_prompts (JSON) and a fallback 'prompt'
+ * field so endpoints that expect prompt in multipart/form-data accept it.
+ */
 async function postFormToProvider(url, apiKey, bodyObj) {
   const form = new FormData();
+
+  // include structured and plain prompt variants
   if (bodyObj.text_prompts) {
     form.append('text_prompts', JSON.stringify(bodyObj.text_prompts));
+    try {
+      const p0 = Array.isArray(bodyObj.text_prompts) && bodyObj.text_prompts[0] && bodyObj.text_prompts[0].text
+        ? bodyObj.text_prompts[0].text
+        : JSON.stringify(bodyObj.text_prompts);
+      form.append('prompt', p0);
+    } catch (e) { /* noop */ }
+  } else if (bodyObj.prompt) {
+    form.append('prompt', String(bodyObj.prompt));
   }
+
   if (bodyObj.width) form.append('width', String(bodyObj.width));
   if (bodyObj.height) form.append('height', String(bodyObj.height));
   if (bodyObj.samples) form.append('samples', String(bodyObj.samples));
@@ -79,6 +94,7 @@ async function postFormToProvider(url, apiKey, bodyObj) {
     body: form,
     timeout: 60000
   });
+
   const text = await resp.text();
   let json = null;
   try { json = JSON.parse(text); } catch (e) { /* not json */ }
@@ -102,7 +118,7 @@ app.post('/api/generate-image', async (req, res) => {
       samples
     };
 
-    // Try JSON
+    // 1) Try JSON
     const jsonAttempt = await postJsonToProvider(IMAGE_API_URL, API_KEY, payload);
     if (jsonAttempt.ok) {
       const pdata = jsonAttempt.json || null;
@@ -132,9 +148,9 @@ app.post('/api/generate-image', async (req, res) => {
       return res.status(500).json({ error: 'No image returned in provider JSON', payload: pdata });
     }
 
-    // JSON failed — decide whether to retry with form-data
+    // 2) JSON failed — check reason and retry with form-data if appropriate
     const lowerText = (jsonAttempt.text || '').toLowerCase();
-    if (jsonAttempt.status === 400 || lowerText.includes('multipart') || lowerText.includes('content-type') || lowerText.includes('accept')) {
+    if (jsonAttempt.status === 400 || lowerText.includes('multipart') || lowerText.includes('content-type') || lowerText.includes('accept') || lowerText.includes('prompt: required')) {
       const formAttempt = await postFormToProvider(IMAGE_API_URL, API_KEY, payload);
       if (formAttempt.ok) {
         const pdata = formAttempt.json || null;
@@ -186,3 +202,4 @@ app.listen(PORT, () => {
   console.log(`Server started on port ${PORT}`);
   console.log(`Image API URL: ${IMAGE_API_URL}`);
 });
+s
